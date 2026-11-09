@@ -1,124 +1,128 @@
-import pkg/raylib
-import std/[net, nativesockets, os]
+import std/[net, os]
+import pkg/vmath
 import unittest2
-import ../src/[Input, NetworkStream, Pong]
+import ../src/[Input, Network, Pong, RaylibConverters]
 
 suite "Multiplayer Replay System Sync Tests":
-  test "Two clients synchronize game state over TCP using ReplaySystem":
-    var server = newSocket()
-    server.setSockOpt(OptReuseAddr, true)
-    server.bindAddr(Port(0))
-    let (_, port) = server.getLocalAddr()
-    server.listen()
+  test "Geometric collision primitives detect overlaps and bounds":
+    let paddle = Rect(pos: vec2(30, 250), size: vec2(15, 100))
+    check Circle(pos: vec2(50, 300), radius: 10).overlaps(paddle)
+    check not Circle(pos: vec2(60, 300), radius: 10).overlaps(paddle)
+    check Circle(pos: vec2(400, 5), radius: 10).outsideVerticalBounds(screenBounds)
+    check Circle(pos: vec2(400, 595), radius: 10).outsideVerticalBounds(screenBounds)
+    check not Circle(pos: vec2(400, 300), radius: 10).outsideVerticalBounds(screenBounds)
 
-    var clientSock = newSocket()
-    clientSock.connect("127.0.0.1", port)
+  test "Two peers negotiate frame time and synchronize game state over UDP":
+    let hostSocket = newUdpSocket()
+    hostSocket.bindAddr(Port(0))
+    let (_, port) = hostSocket.getLocalAddr()
 
-    var hostSock: Socket
-    var addrStr = ""
-    server.acceptAddr(hostSock, addrStr)
-    server.close()
+    let clientSocket = newUdpSocket()
+    clientSocket.sendClientHello(ActionNames, "127.0.0.1", port.int)
 
-    var hostGame = initPongGame()
-    var clientGame = initPongGame()
+    let negotiatedFps = 240
+    let hostSession = hostSocket.acceptSession(ActionNames, fps = negotiatedFps)
+    let clientSession = clientSocket.completeClientHandshake(ActionNames)
+    defer:
+      hostSession.close()
+      clientSession.close()
+
+    check hostSession.fixedFrameTime == clientSession.fixedFrameTime
+    check clientSession.targetFps == negotiatedFps
+
+    var hostGame = initPongGame(hostSession.fixedFrameTime)
+    var clientGame = initPongGame(clientSession.fixedFrameTime)
 
     let hostActions = hostGame.makeActions()
     let clientActions = clientGame.makeActions()
 
-    var hostRecorder = initStreamReplayRecorder[ActionNames](newSocketStream(hostSock), hostActions)
-    var hostRemotePlayer = initStreamReplayPlayer[ActionNames](newSocketStream(hostSock), hostActions)
+    var hostRecorder = initReplayRecorder(hostActions)
+    var hostRemotePlayer = initReplayPlayer(hostActions)
 
-    var clientRecorder = initStreamReplayRecorder[ActionNames](newSocketStream(clientSock), clientActions)
-    var clientRemotePlayer = initStreamReplayPlayer[ActionNames](newSocketStream(clientSock), clientActions)
+    var clientRecorder = initReplayRecorder(clientActions)
+    var clientRemotePlayer = initReplayPlayer(clientActions)
 
-    for tick in 0'u64 ..< 120'u64:
-      hostGame.p1MoveDir = 0.0
-      hostGame.p2MoveDir = 0.0
-      clientGame.p1MoveDir = 0.0
-      clientGame.p2MoveDir = 0.0
+    for tick in 0 ..< 240:
+      hostGame.resetMoveDirections()
+      clientGame.resetMoveDirections()
 
-      # Host local inputs
-      hostRecorder.recordFrameData(NoopTick, hostGame.tickN, true, true)
-      hostRecorder.recordFrameData(SetDeltaTime, hostGame.tickN, fixedDeltaTime, true)
-      hostRecorder.addRecordingInputReader(
-        p1KeyBindings,
-        proc(k: KeyboardKey): bool =
-          k == KeyboardKey.W and (tick mod 2 == 0),
-        hostGame.tickN,
-        hostGame.deltaTime,
-        true,
+      hostRecorder.readInputs(
+        keyBindings[Player1],
+        proc(key: KeyboardKey): bool =
+          key == KeyboardKey.W and (tick mod 2 == 0),
+        hostGame.tick,
       )
-      hostRecorder.flush()
+      hostSession.sendReplay(hostRecorder.flushChunk())
 
-      # Client local inputs
-      clientRecorder.recordFrameData(NoopTick, clientGame.tickN, true, true)
-      clientRecorder.addRecordingInputReader(
-        p2KeyBindings,
-        proc(k: KeyboardKey): bool =
-          k == KeyboardKey.S and (tick mod 3 == 0),
-        clientGame.tickN,
-        clientGame.deltaTime,
-        true,
+      clientRecorder.readInputs(
+        keyBindings[Player2],
+        proc(key: KeyboardKey): bool =
+          key == KeyboardKey.S and (tick mod 3 == 0),
+        clientGame.tick,
       )
-      clientRecorder.flush()
+      clientSession.sendReplay(clientRecorder.flushChunk())
 
-      # Both play remote actions
-      let hostPlay = hostRemotePlayer.play(hostGame.tickN)
-      let clientPlay = clientRemotePlayer.play(clientGame.tickN)
+      let clientMessage = hostSession.receive()
+      let hostMessage = clientSession.receive()
+      check clientMessage.kind == ReplayUpdate
+      check hostMessage.kind == ReplayUpdate
 
-      check not hostPlay.replayEnded
-      check not clientPlay.replayEnded
+      let hostPlayback = hostRemotePlayer.playChunk(clientMessage.chunk, hostGame.tick)
+      let clientPlayback = clientRemotePlayer.playChunk(hostMessage.chunk, clientGame.tick)
+      check not hostPlayback.replayEnded
+      check not clientPlayback.replayEnded
 
       hostGame.updateSimulation()
       clientGame.updateSimulation()
 
-      check hostGame.p1Y == clientGame.p1Y
-      check hostGame.p2Y == clientGame.p2Y
-      check hostGame.ballPos == clientGame.ballPos
-      check hostGame.ballVel == clientGame.ballVel
-      check hostGame.score1 == clientGame.score1
-      check hostGame.score2 == clientGame.score2
+      check hostGame.players == clientGame.players
+      check hostGame.ball == clientGame.ball
+      check hostGame.ballVelocity == clientGame.ballVelocity
 
-    hostSock.close()
-    clientSock.close()
+    clientSession.sendDisconnect()
+    check hostSession.receive().kind == Disconnect
 
-  test "File replay recording and playback matches simulation":
+  test "Framerate negotiation enforces valid monitor FPS range":
+    expect ValueError:
+      validateTargetFps(minTargetFps - 1)
+    expect ValueError:
+      validateTargetFps(maxTargetFps + 1)
+    validateTargetFps(minTargetFps)
+    validateTargetFps(144)
+    validateTargetFps(maxTargetFps)
+
+  test "Input.nim file replay recording and playback works without NoopTick":
     let replayName = "/tmp/test_pong_replay"
     let replayFile = ActionNames.getReplayFilename(replayName)
+    defer:
+      if fileExists(replayFile):
+        removeFile(replayFile)
 
-    var game1 = initPongGame()
-    var recorder = initReplayRecorder[ActionNames](replayName, game1.makeActions())
+    var recordedGame = initPongGame()
+    var recorder = initReplayRecorder(replayName, recordedGame.makeActions())
 
-    for tick in 0'u64 ..< 60'u64:
-      game1.p1MoveDir = 0.0
-      game1.p2MoveDir = 0.0
-      recorder.recordFrameData(NoopTick, game1.tickN, true, true)
-      recorder.recordFrameData(SetDeltaTime, game1.tickN, fixedDeltaTime, true)
-      recorder.addRecordingInputReader(
-        p1KeyBindings,
-        proc(k: KeyboardKey): bool =
-          k == KeyboardKey.W,
-        game1.tickN,
-        game1.deltaTime,
-        true,
+    for tick in 0 ..< 60:
+      recordedGame.resetMoveDirections()
+      recorder.readInputs(
+        keyBindings[Player1],
+        proc(key: KeyboardKey): bool =
+          key == KeyboardKey.W and tick < 30,
+        recordedGame.tick,
       )
-      game1.updateSimulation()
+      recordedGame.updateSimulation()
     recorder.deinit()
 
-    var game2 = initPongGame()
-    var player = initReplayPlayer[ActionNames](replayName, game2.makeActions())
+    var replayedGame = initPongGame()
+    var player = initReplayPlayer(replayName, replayedGame.makeActions())
     while true:
-      game2.p1MoveDir = 0.0
-      game2.p2MoveDir = 0.0
-      let res = player.play(game2.tickN)
-      if res.replayEnded:
+      replayedGame.resetMoveDirections()
+      let playbackResult = player.play(replayedGame.tick)
+      if playbackResult.replayEnded:
         break
-      game2.updateSimulation()
+      replayedGame.updateSimulation()
     player.deinit()
 
-    check game1.tickN == game2.tickN
-    check game1.p1Y == game2.p1Y
-    check game1.p2Y == game2.p2Y
-    check game1.ballPos == game2.ballPos
-    check game1.ballVel == game2.ballVel
-    removeFile(replayFile)
+    check recordedGame.tick == replayedGame.tick
+    check recordedGame.players == replayedGame.players
+    check recordedGame.ball == replayedGame.ball
+    check recordedGame.ballVelocity == replayedGame.ballVelocity

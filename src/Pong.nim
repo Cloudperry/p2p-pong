@@ -1,6 +1,6 @@
-import std/[net, nativesockets, strformat, tables]
-import pkg/[raylib, confutils, glm]
-import ./[Input, NetworkStream]
+import std/[strformat, tables]
+import pkg/[confutils, vmath]
+import ./[Input, Network, RaylibConverters]
 
 const
   screenWidth* = 800
@@ -12,14 +12,13 @@ const
   ballRadius* = 10.0
   initialBallSpeedX* = 350.0
   initialBallSpeedY* = 220.0
-  fixedDeltaTime* = 1.0 / 60.0
 
 type
   Config* = object
     host* {.
       name: "host",
       defaultValue: false,
-      desc: "Run as host (Player 1, left paddle) and wait for a client connection"
+      desc: "Run as host (Player 1, left paddle) and wait for a client"
     .}: bool
     connectIp* {.
       name: "connect",
@@ -29,319 +28,215 @@ type
     port* {.
       name: "port",
       defaultValue: 7777,
-      desc: "TCP port to listen on or connect to"
+      desc: "UDP port to listen on or connect to"
     .}: int
-    recordReplay* {.
-      name: "recordReplay",
-      defaultValue: "",
-      desc: "Optional replay name to record the match to disk"
-    .}: string
-    playReplay* {.
-      name: "playReplay",
-      defaultValue: "",
-      desc: "Optional replay name to play back from disk without networking"
-    .}: string
+    fps* {.
+      name: "fps",
+      defaultValue: defaultTargetFps,
+      desc: "Target framerate set by the host (30..600 FPS)"
+    .}: int
+
+  Circle* = object
+    pos*: Vec2
+    radius*: float
+
+  Rect* = object
+    pos*: Vec2
+    size*: Vec2
+
+  PlayerId* = enum
+    Player1
+    Player2
 
   ActionNames* = enum
-    NoopTick
-    P1MoveUp
-    P1MoveDown
-    P2MoveUp
-    P2MoveDown
-    SetDeltaTime
+    Player1MoveUp
+    Player1MoveDown
+    Player2MoveUp
+    Player2MoveDown
+
+  Player* = object
+    paddle*: Rect
+    moveDirection*: float
+    score*: int
 
   PongGame* = ref object
-    p1Y*, p2Y*: float
-    p1MoveDir*, p2MoveDir*: float
-    ballPos*: Vec2f
-    ballVel*: Vec2f
-    score1*, score2*: int
+    players*: array[PlayerId, Player]
+    ball*: Circle
+    ballVelocity*: Vec2
     deltaTime*: float
-    tickN*: uint64
+    tick*: int
 
-proc resetBall*(game: PongGame, dirX: float) =
-  game.ballPos = vec2f(screenWidth / 2.0, screenHeight / 2.0)
-  game.ballVel = vec2f(initialBallSpeedX * dirX, initialBallSpeedY)
+const
+  screenBounds* = Rect(pos: vec2(0, 0), size: vec2(screenWidth, screenHeight))
+  paddleSize = vec2(paddleWidth, paddleHeight)
+  paddleX: array[PlayerId, float] = [
+    Player1: paddleMargin,
+    Player2: screenWidth - paddleMargin - paddleWidth,
+  ]
+  bounceDirectionX: array[PlayerId, float] = [Player1: 1.0, Player2: -1.0]
+  paddleBounceX: array[PlayerId, float] = [
+    Player1: paddleX[Player1] + paddleWidth + ballRadius,
+    Player2: paddleX[Player2] - ballRadius,
+  ]
+  scoreCenterX: array[PlayerId, int] = [
+    Player1: screenWidth div 4,
+    Player2: (screenWidth * 3) div 4,
+  ]
+  windowTitles: array[PlayerId, string] = [
+    Player1: "Pong - Player 1 (Host)",
+    Player2: "Pong - Player 2 (Client)",
+  ]
 
-proc initPongGame*(): PongGame =
-  result = PongGame(
-    p1Y: (screenHeight - paddleHeight) / 2.0,
-    p2Y: (screenHeight - paddleHeight) / 2.0,
-    deltaTime: fixedDeltaTime,
+proc overlaps*(circle: Circle, rect: Rect): bool =
+  ## Returns true if `circle` overlaps `rect`.
+  let closest = vec2(
+    clamp(circle.pos.x, rect.pos.x, rect.pos.x + rect.size.x),
+    clamp(circle.pos.y, rect.pos.y, rect.pos.y + rect.size.y),
   )
-  result.resetBall(1.0)
+  dist(circle.pos, closest) < circle.radius
+
+proc outsideVerticalBounds*(circle: Circle, bounds: Rect): bool =
+  ## Returns true if `circle` extends past the top or bottom edge of `bounds`.
+  circle.pos.y - circle.radius < bounds.pos.y or
+    circle.pos.y + circle.radius > bounds.pos.y + bounds.size.y
+
+proc resetBall*(game: PongGame, directionX: float) =
+  game.ball = Circle(pos: vec2(screenWidth / 2, screenHeight / 2), radius: ballRadius)
+  game.ballVelocity = vec2(initialBallSpeedX * directionX, initialBallSpeedY)
+
+proc initPongGame*(deltaTime = 1 / defaultTargetFps): PongGame =
+  let startY = (screenHeight - paddleHeight) / 2
+  result = PongGame(deltaTime: deltaTime)
+  for id in PlayerId:
+    result.players[id].paddle = Rect(pos: vec2(paddleX[id], startY), size: paddleSize)
+  result.resetBall(1)
+
+proc resetMoveDirections*(game: PongGame) =
+  for id in PlayerId:
+    game.players[id].moveDirection = 0
 
 proc makeActions*(game: PongGame): Actions[ActionNames] =
+  proc moveAction(id: PlayerId, step: float): Action =
+    initBoolAction(proc(active: bool) = game.players[id].moveDirection += step)
+
   {
-    NoopTick: initBoolAction(
-      proc(active: bool) =
-        discard,
-      runOnlyWhenNonZero = false,
-    ),
-    P1MoveUp: initBoolAction(
-      proc(active: bool) =
-        game.p1MoveDir -= 1.0
-    ),
-    P1MoveDown: initBoolAction(
-      proc(active: bool) =
-        game.p1MoveDir += 1.0
-    ),
-    P2MoveUp: initBoolAction(
-      proc(active: bool) =
-        game.p2MoveDir -= 1.0
-    ),
-    P2MoveDown: initBoolAction(
-      proc(active: bool) =
-        game.p2MoveDir += 1.0
-    ),
-    SetDeltaTime: initFloatAction(
-      proc(dt: float) =
-        game.deltaTime = dt,
-      runOnlyWhenNonZero = false,
-    ),
+    Player1MoveUp: moveAction(Player1, -1),
+    Player1MoveDown: moveAction(Player1, 1),
+    Player2MoveUp: moveAction(Player2, -1),
+    Player2MoveDown: moveAction(Player2, 1),
   }.toTable
 
 proc updateSimulation*(game: PongGame) =
-  let dt = game.deltaTime
+  for id in PlayerId:
+    let nextY =
+      game.players[id].paddle.pos.y +
+      game.players[id].moveDirection * paddleSpeed * game.deltaTime
+    game.players[id].paddle.pos.y = clamp(nextY, 0.0, screenHeight - paddleHeight)
 
-  # Update paddles
-  game.p1Y = clamp(
-    game.p1Y + game.p1MoveDir * paddleSpeed * dt,
-    0.0,
-    screenHeight.float - paddleHeight,
-  )
-  game.p2Y = clamp(
-    game.p2Y + game.p2MoveDir * paddleSpeed * dt,
-    0.0,
-    screenHeight.float - paddleHeight,
-  )
+  game.ball.pos += game.ballVelocity * game.deltaTime
 
-  # Update ball position
-  game.ballPos.x += game.ballVel.x * dt
-  game.ballPos.y += game.ballVel.y * dt
+  if game.ball.outsideVerticalBounds(screenBounds):
+    game.ball.pos.y = clamp(game.ball.pos.y, ballRadius, screenHeight - ballRadius)
+    game.ballVelocity.y = -game.ballVelocity.y
 
-  # Top and bottom wall collisions
-  if game.ballPos.y - ballRadius <= 0.0 and game.ballVel.y < 0.0:
-    game.ballPos.y = ballRadius
-    game.ballVel.y = -game.ballVel.y
-  elif game.ballPos.y + ballRadius >= screenHeight.float and game.ballVel.y > 0.0:
-    game.ballPos.y = screenHeight.float - ballRadius
-    game.ballVel.y = -game.ballVel.y
+  for id in PlayerId:
+    let paddle = game.players[id].paddle
+    if game.ball.overlaps(paddle) and game.ballVelocity.x * bounceDirectionX[id] < 0:
+      game.ball.pos.x = paddleBounceX[id]
+      game.ballVelocity.x = -game.ballVelocity.x
+      let paddleCenterY = paddle.pos.y + paddle.size.y / 2
+      let hitOffset = (game.ball.pos.y - paddleCenterY) / (paddle.size.y / 2)
+      game.ballVelocity.y = hitOffset * initialBallSpeedY * 1.5
 
-  # Left paddle (P1) collision
-  let p1Right = paddleMargin + paddleWidth
-  if game.ballVel.x < 0.0 and
-      game.ballPos.x - ballRadius <= p1Right and
-      game.ballPos.x + ballRadius >= paddleMargin and
-      game.ballPos.y + ballRadius >= game.p1Y and
-      game.ballPos.y - ballRadius <= game.p1Y + paddleHeight:
-    game.ballPos.x = p1Right + ballRadius
-    game.ballVel.x = -game.ballVel.x
-    let hitOffset =
-      ((game.ballPos.y - (game.p1Y + paddleHeight / 2.0)) / (paddleHeight / 2.0))
-    game.ballVel.y = hitOffset * initialBallSpeedY * 1.5
+  if game.ball.pos.x + ballRadius < 0:
+    game.players[Player2].score += 1
+    game.resetBall(1)
+  elif game.ball.pos.x - ballRadius > screenWidth:
+    game.players[Player1].score += 1
+    game.resetBall(-1)
 
-  # Right paddle (P2) collision
-  let p2Left = screenWidth.float - paddleMargin - paddleWidth
-  if game.ballVel.x > 0.0 and
-      game.ballPos.x + ballRadius >= p2Left and
-      game.ballPos.x - ballRadius <= p2Left + paddleWidth and
-      game.ballPos.y + ballRadius >= game.p2Y and
-      game.ballPos.y - ballRadius <= game.p2Y + paddleHeight:
-    game.ballPos.x = p2Left - ballRadius
-    game.ballVel.x = -game.ballVel.x
-    let hitOffset =
-      ((game.ballPos.y - (game.p2Y + paddleHeight / 2.0)) / (paddleHeight / 2.0))
-    game.ballVel.y = hitOffset * initialBallSpeedY * 1.5
-
-  # Scoring
-  if game.ballPos.x + ballRadius < 0.0:
-    game.score2 += 1
-    game.resetBall(1.0)
-  elif game.ballPos.x - ballRadius > screenWidth.float:
-    game.score1 += 1
-    game.resetBall(-1.0)
-
-  game.tickN += 1
+  game.tick += 1
 
 proc drawGame*(game: PongGame) =
   clearBackground(Black)
 
-  # Center dashed line
   for y in countup(0, screenHeight, 30):
-    drawRectangle(
-      int32(screenWidth div 2 - 2), int32(y), 4, 15, DarkGray
-    )
+    drawRectangle(screenWidth div 2 - 2, y, 4, 15, DarkGray)
 
-  # Scores
-  let s1Text = $game.score1
-  let s2Text = $game.score2
-  drawText(
-    s1Text,
-    int32(screenWidth div 4 - measureText(s1Text, 40) div 2),
-    30,
-    40,
-    RayWhite,
-  )
-  drawText(
-    s2Text,
-    int32((screenWidth * 3) div 4 - measureText(s2Text, 40) div 2),
-    30,
-    40,
-    RayWhite,
-  )
+  for id, player in game.players:
+    let scoreText = $player.score
+    let scoreX = scoreCenterX[id] - measureText(scoreText, 40) div 2
+    drawText(scoreText, scoreX, 30, 40, RayWhite)
+    drawRectangle(player.paddle.pos, player.paddle.size, RayWhite)
 
-  # Paddles
-  drawRectangle(
-    int32(paddleMargin),
-    int32(game.p1Y),
-    int32(paddleWidth),
-    int32(paddleHeight),
-    RayWhite,
-  )
-  drawRectangle(
-    int32(screenWidth.float - paddleMargin - paddleWidth),
-    int32(game.p2Y),
-    int32(paddleWidth),
-    int32(paddleHeight),
-    RayWhite,
-  )
+  drawCircle(game.ball.pos, game.ball.radius, RayWhite)
 
-  # Ball
-  drawCircle(
-    Vector2(x: game.ballPos.x, y: game.ballPos.y),
-    float32(ballRadius),
-    RayWhite,
-  )
+proc makeKeyBindings(
+    moveUp, moveDown: ActionNames
+): InputsToActions[ActionNames, KeyboardKey] =
+  {
+    KeyboardKey.Comma: moveUp,
+    KeyboardKey.W: moveUp,
+    KeyboardKey.Up: moveUp,
+    KeyboardKey.O: moveDown,
+    KeyboardKey.S: moveDown,
+    KeyboardKey.Down: moveDown,
+  }.toTable
 
-proc setupNetwork(conf: Config): Socket =
-  if conf.host:
-    var server = newSocket()
-    server.setSockOpt(OptReuseAddr, true)
-    server.bindAddr(Port(conf.port))
-    server.listen()
-    echo fmt"Waiting for Player 2 to connect on port {conf.port}..."
-    var client: Socket
-    var address = ""
-    server.acceptAddr(client, address)
-    echo fmt"Player 2 connected from {address}"
-    server.close()
-    client.getFd().setBlocking(true)
-    return client
-  elif conf.connectIp.len > 0:
-    var sock = newSocket()
-    echo fmt"Connecting to host {conf.connectIp}:{conf.port}..."
-    sock.connect(conf.connectIp, Port(conf.port))
-    echo "Connected to host!"
-    sock.getFd().setBlocking(true)
-    return sock
+const keyBindings*: array[PlayerId, InputsToActions[ActionNames, KeyboardKey]] = [
+  Player1: makeKeyBindings(Player1MoveUp, Player1MoveDown),
+  Player2: makeKeyBindings(Player2MoveUp, Player2MoveDown),
+]
+
+proc setupNetwork(config: Config): NetworkSession[ActionNames] =
+  if config.host:
+    if config.fps notin minTargetFps .. maxTargetFps:
+      quit fmt"Framerate must be between {minTargetFps} and {maxTargetFps} FPS"
+    return hostSession(ActionNames, config.port, config.fps)
+  elif config.connectIp.len > 0:
+    return joinSession(ActionNames, config.connectIp, config.port)
   else:
-    quit "Please specify either --host or --connect=<ip> (or --playReplay=<name>)"
+    quit "Please specify either --host or --connect=<ip>"
 
-const
-  p1KeyBindings*: InputsToActions[ActionNames, KeyboardKey] = {
-    KeyboardKey.Comma: P1MoveUp,
-    KeyboardKey.W: P1MoveUp,
-    KeyboardKey.Up: P1MoveUp,
-    KeyboardKey.O: P1MoveDown,
-    KeyboardKey.S: P1MoveDown,
-    KeyboardKey.Down: P1MoveDown,
-  }.toTable
+proc main() =
+  let config = Config.load()
+  let session = setupNetwork(config)
+  defer:
+    session.close()
 
-  p2KeyBindings*: InputsToActions[ActionNames, KeyboardKey] = {
-    KeyboardKey.Comma: P2MoveUp,
-    KeyboardKey.W: P2MoveUp,
-    KeyboardKey.Up: P2MoveUp,
-    KeyboardKey.O: P2MoveDown,
-    KeyboardKey.S: P2MoveDown,
-    KeyboardKey.Down: P2MoveDown,
-  }.toTable
+  var game = initPongGame(session.fixedFrameTime)
+  let actions = game.makeActions()
+  var localRecorder = initReplayRecorder(actions)
+  var remotePlayer = initReplayPlayer(actions)
+
+  let localPlayer = if config.host: Player1 else: Player2
+  initWindow(screenWidth, screenHeight, windowTitles[localPlayer])
+  defer:
+    closeWindow()
+  setTargetFPS(session.targetFps)
+
+  var peerDisconnected = false
+  while not windowShouldClose():
+    game.resetMoveDirections()
+
+    localRecorder.readInputs(keyBindings[localPlayer], isKeyDown, game.tick)
+    session.sendReplay(localRecorder.flushChunk())
+
+    let remoteMessage = session.receive()
+    if remoteMessage.kind == Disconnect:
+      echo "Peer disconnected."
+      peerDisconnected = true
+      break
+    discard remotePlayer.playChunk(remoteMessage.chunk, game.tick)
+
+    game.updateSimulation()
+
+    beginDrawing()
+    game.drawGame()
+    endDrawing()
+
+  if not peerDisconnected:
+    session.sendDisconnect()
 
 when isMainModule:
-  let conf = Config.load()
-  var game = initPongGame()
-  let actions = game.makeActions()
-
-  if conf.playReplay.len > 0:
-    var filePlayer = initReplayPlayer[ActionNames](conf.playReplay, actions)
-    initWindow(screenWidth, screenHeight, "Pong - Replay")
-    setTargetFPS(60)
-    while not windowShouldClose():
-      game.p1MoveDir = 0.0
-      game.p2MoveDir = 0.0
-      let res = filePlayer.play(game.tickN)
-      if res.replayEnded:
-        break
-      game.updateSimulation()
-      beginDrawing()
-      game.drawGame()
-      endDrawing()
-    filePlayer.deinit()
-    closeWindow()
-  else:
-    let netSocket = setupNetwork(conf)
-    let sendStream = newSocketStream(netSocket)
-    let recvStream = newSocketStream(netSocket)
-
-    var localRecorder = initStreamReplayRecorder[ActionNames](sendStream, actions)
-    var remotePlayer = initStreamReplayPlayer[ActionNames](recvStream, actions)
-
-    let recordingToFile = conf.recordReplay.len > 0
-    var fileRecorder: ReplaySystem[ActionNames]
-    if recordingToFile:
-      fileRecorder = initReplayRecorder[ActionNames](conf.recordReplay, actions)
-
-    let isHost = conf.host
-    let localBindings = if isHost: p1KeyBindings else: p2KeyBindings
-    let winTitle = if isHost: "Pong - Player 1 (Host)" else: "Pong - Player 2 (Client)"
-
-    initWindow(screenWidth, screenHeight, winTitle)
-    setTargetFPS(60)
-
-    while not windowShouldClose():
-      game.p1MoveDir = 0.0
-      game.p2MoveDir = 0.0
-
-      # Always record a tick marker so every tick is represented in the replay buffer
-      localRecorder.recordFrameData(NoopTick, game.tickN, true, true)
-      if isHost:
-        game.deltaTime = fixedDeltaTime
-        localRecorder.recordFrameData(SetDeltaTime, game.tickN, game.deltaTime, true)
-
-      # Read local player inputs and record them into the outgoing replay buffer
-      localRecorder.addRecordingInputReader(
-        localBindings,
-        proc(k: KeyboardKey): bool =
-          isKeyDown(k),
-        game.tickN,
-        game.deltaTime,
-        true,
-      )
-
-      if recordingToFile:
-        for i in 0 ..< localRecorder.buf.i:
-          fileRecorder.recordActionAndFlushToFile(localRecorder.buf.data[i])
-
-      # Flush local replay buffer over the network socket
-      localRecorder.flush()
-
-      # Receive and play remote player's replay buffer for this tick
-      let playback = remotePlayer.play(game.tickN)
-      if playback.replayEnded:
-        echo "Peer disconnected."
-        break
-
-      if recordingToFile:
-        for act in playback.playedActions:
-          fileRecorder.recordActionAndFlushToFile(act)
-
-      game.updateSimulation()
-
-      beginDrawing()
-      game.drawGame()
-      endDrawing()
-
-    if recordingToFile:
-      fileRecorder.deinit()
-    netSocket.close()
-    closeWindow()
+  main()

@@ -1,22 +1,20 @@
-## A fixed-size ring buffer. Once it fills up, `i` wraps back to the start and
+## A fixed-size ring buffer. Once it fills up, `writeIndex` wraps back to the start and
 ## old values get overwritten. Used for storing the last N frame times and replay actions.
 type CircularBuffer*[N: Natural, T] = object
   data*: array[N, T]
-  i*: Natural = 0 # TODO: Rename this to something less confusing
+  writeIndex*: Natural = 0
 
-proc push*[N, T](b: var CircularBuffer[N, T], v: T) =
+proc push*[N, T](buffer: var CircularBuffer[N, T], value: T) =
   ## Writes a value at the current index and advances it, wrapping around at the end.
-  b.data[b.i] = v
-  b.i += 1
-  b.i = b.i mod b.data.len
+  buffer.data[buffer.writeIndex] = value
+  buffer.writeIndex = (buffer.writeIndex + 1) mod buffer.data.len
 
-iterator range*[N, T](b: CircularBuffer[N, T], iStart, iEnd: Natural): T =
-  ## Yields values from iStart to iEnd (inclusive), wrapping around the end of the buffer.
-  var i = iStart
+iterator range*[N, T](buffer: CircularBuffer[N, T], startIndex, endIndex: Natural): T =
+  ## Yields values from startIndex to endIndex (inclusive), wrapping around the end of the buffer.
+  var index = startIndex
   while true:
-    yield b.data[i]
-    if i == iEnd:
+    yield buffer.data[index]
+    if index == endIndex:
       break
 
-    i += 1
-    i = i mod b.data.len
+    index = (index + 1) mod buffer.data.len
